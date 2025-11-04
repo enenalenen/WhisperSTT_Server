@@ -47,6 +47,12 @@ NOISE_THRESHOLD = 300 # 앱에서 변경 가능한 전역 변수
 SILENCE_DURATION_SECONDS = 1.0
 REQUIRED_SILENCE_CHUNKS = int(SILENCE_DURATION_SECONDS * RATE / CHUNK)
 
+# ▼▼▼ [버그 수정 5] 사용자가 제안한 '최소 음성 길이' 필터 설정 ▼▼▼
+# (0.5초 / (2048/16000)초) -> 0.5 / 0.128 = 3.9 (약 4개 청크)
+MIN_SPEECH_DURATION_SECONDS = 0.5 
+REQUIRED_SPEECH_CHUNKS = int(MIN_SPEECH_DURATION_SECONDS * RATE / CHUNK)
+# ▲▲▲ [버그 수정 5 완료] ▲▲▲
+
 # ▼▼▼ whisper-server.exe 주소를 다시 사용합니다 ▼▼▼
 WHISPER_SERVER_URL = "http://127.0.0.1:8081/inference" 
 # ▲▲▲ 수정 끝 ▲▲▲
@@ -69,27 +75,54 @@ class HighPassFilter:
         self.last_input = 0
         self.last_output = 0
 
+    # ▼▼▼ [버그 수정 1] 오버플로우 방지 및 상태 초기화 로직이 적용된 process 함수 ▼▼▼
     def process(self, input_data):
         samples = np.frombuffer(input_data, dtype=np.int16)
         filtered_samples = np.zeros_like(samples)
-        last_in, last_out = self.last_input, self.last_output
         
+        # 상태 변수를 64비트 부동소수점(float64)으로 로드하여 계산 정밀도 향상
+        last_in = np.float64(self.last_input)
+        last_out = np.float64(self.last_output)
+        alpha = self.alpha # (alpha는 이미 float)
+
         INT16_MIN = -32768
         INT16_MAX = 32767
 
         for i in range(len(samples)):
-            last_out = self.alpha * (last_out + samples[i] - last_in)
-            last_in = samples[i]
-            
-            if last_out > INT16_MAX:
-                last_out = INT16_MAX
-            elif last_out < INT16_MIN:
-                last_out = INT16_MIN
+            try:
+                # 계산 중 오버플로우가 발생하면 RuntimeWarning 대신 예외(Error)를 발생시킴
+                with np.errstate(over='raise', invalid='raise'):
+                    
+                    # 64비트 float으로 계산하여 중간 과정의 오버플로우 방지
+                    last_out = alpha * (last_out + np.float64(samples[i]) - last_in)
+                    last_in = np.float64(samples[i])
 
+                # 계산 결과가 비정상적인 값(inf: 무한대, NaN: 숫자 아님)인지 확인
+                if not np.isfinite(last_out):
+                    # 비정상 값이면 필터 상태를 0으로 강제 초기화 (오염 방지)
+                    last_in = 0.0
+                    last_out = 0.0
+                
+                # 오디오 샘플은 16비트 정수 범위를 넘지 않도록 값 제한 (클리핑)
+                if last_out > INT16_MAX:
+                    last_out = np.float64(INT16_MAX)
+                elif last_out < INT16_MIN:
+                    last_out = np.float64(INT16_MIN)
+
+            except (FloatingPointError, OverflowError):
+                # 'with np.errstate' 구문에서 예외가 발생한 경우 (오버플로우 감지)
+                # 필터 상태를 즉시 0으로 초기화하여 다음 샘플부터 정상 처리되도록 함
+                last_in = 0.0
+                last_out = 0.0
+                
             filtered_samples[i] = int(last_out)
             
-        self.last_input, self.last_output = last_in, last_out
+        # 다시 int형으로 변환하여 다음 처리를 위해 상태 저장
+        self.last_input = int(last_in)
+        self.last_output = int(last_out)
+        
         return filtered_samples.tobytes()
+    # ▲▲▲ [버그 수정 1 완료] ▲▲▲
 
 def create_wav_file(pcm_data, rate, is_temp=True, filename_prefix="rec_"):
     timestamp = int(time.time())
@@ -125,10 +158,26 @@ def run_stt(file_path):
         with open(normalized_path, 'rb') as f:
             files = {'file': (os.path.basename(file_path), f, 'audio/wav')}
             
+            # ▼▼▼ [버그 수정 4] 환각 억제 파라미터를 더 공격적으로 수정 ▼▼▼
             data = {
                 'response_format': 'json',
-                'language': 'ko' 
+                'language': 'ko',
+                
+                # 1. 확정적 디코딩 (수정 없음)
+                'temperature': 0.0,
+                
+                # 2. 로그 확률 임계값: -1.0 -> -0.5로 상향. (환각 억제 강화)
+                #    모델이 -0.5보다 낮은 확률로 추측하는 단어는 무시함.
+                'logprob_threshold': -0.5, 
+                
+                # 3. '음성 없음' 임계값: 0.6 -> 0.7로 상향. (노이즈 억제 강화)
+                #    모델이 70% 이상 '음성 없음'으로 판단하면 빈 텍스트 반환
+                'no_speech_threshold': 0.7,
+                
+                # 4. 프롬프트 초기화: ' ' -> '' (빈 문자열)로 변경
+                'prompt': ''
             }
+            # ▲▲▲ [버그 수정 4 완료] ▲▲▲
             
             response = requests.post(WHISPER_SERVER_URL, files=files, data=data)
 
@@ -161,7 +210,7 @@ def process_and_send_keywords(audio_buffer):
     if not audio_buffer: return
     temp_wav_path = create_wav_file(bytes(audio_buffer), RATE, is_temp=True)
     text_result = run_stt(temp_wav_path)
-    if text_result:
+    if text_result: # text_result가 비어있지 않은 경우에만 키워드 검사
         keywords_to_send = []
         with keywords_lock: current_target_keywords = TARGET_KEYWORDS[:]
         
@@ -204,6 +253,9 @@ def handle_audio_client(client_socket):
     manual_recording_buffer = bytearray()
     manual_recording_start_time = 0
 
+    # ▼▼▼ [버그 수정 5] '음성'으로 감지된 청크의 수를 세는 카운터 추가 ▼▼▼
+    speech_chunk_counter = 0
+    
     try:
         while True:
             data = client_socket.recv(CHUNK * SAMPWIDTH)
@@ -233,15 +285,28 @@ def handle_audio_client(client_socket):
                 is_speaking = True
                 silence_counter = 0
                 audio_buffer.extend(filtered_data)
+                
+                # ▼▼▼ [버그 수정 5] '음성' 청크 카운트 증가 ▼▼▼
+                speech_chunk_counter += 1
+                
             elif is_speaking:
                 silence_counter += 1
                 audio_buffer.extend(filtered_data)
+                
                 if silence_counter > REQUIRED_SILENCE_CHUNKS:
-                    print(f"\nSilence detected, processing speech...")
-                    process_and_send_keywords(audio_buffer)
+                    # ▼▼▼ [버그 수정 5] STT 요청 전, 음성 청크의 수가 최소 기준(0.5초)을 넘는지 확인 ▼▼▼
+                    if speech_chunk_counter >= REQUIRED_SPEECH_CHUNKS:
+                        print(f"\nSpeech long enough ({speech_chunk_counter} chunks), processing speech...")
+                        process_and_send_keywords(audio_buffer)
+                    else:
+                        print(f"\nSpeech too short ({speech_chunk_counter} chunks < {REQUIRED_SPEECH_CHUNKS}), ignoring as noise burst...")
+                    # ▲▲▲ [버그 수정 5 완료] ▲▲▲
+
+                    # 버퍼 및 상태 변수 초기화
                     audio_buffer.clear()
                     is_speaking = False
                     silence_counter = 0
+                    speech_chunk_counter = 0 # 카운터 초기화
 
     except (ConnectionResetError, socket.error):
         print("\n[*] Audio client connection lost.")
