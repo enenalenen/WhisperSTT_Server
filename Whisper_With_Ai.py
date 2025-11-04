@@ -68,8 +68,10 @@ CHANNELS = 1
 SAMPWIDTH = 2
 CHUNK = 2048 # (0.128초)
 
-# VAD 설정 (STT Worker용)
-NOISE_THRESHOLD = 300 
+# ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
+# [수정] VAD 설정 (STT Worker용) - 기본값 2000으로 변경
+NOISE_THRESHOLD = 2000 
+# ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 SILENCE_DURATION_SECONDS = 1.0
 REQUIRED_SILENCE_CHUNKS = int(SILENCE_DURATION_SECONDS * RATE / CHUNK)
 MIN_SPEECH_DURATION_SECONDS = 0.5 # (0.5초 미만 소음 무시)
@@ -126,7 +128,10 @@ try:
     print(f"[*] Loading Sound Classification model from {SC_MODEL_PATH}...")
     # (preprocessor.py는 함수 모음이므로, 클래스 인스턴스 생성 불필요)
     # CPU로 모델 로드 (GPU 사용 시 'cpu' 제거)
-    sc_model = torch.load(SC_MODEL_PATH, map_location=torch.device('cpu')) 
+    
+    # [버그 수정] PyTorch 2.6+ 호환을 위해 weights_only=False 추가
+    sc_model = torch.load(SC_MODEL_PATH, map_location=torch.device('cpu'), weights_only=False) 
+    
     sc_model.eval() # 추론 모드로 설정
     print("[*] Sound Classification model loaded successfully.")
 except FileNotFoundError:
@@ -271,7 +276,7 @@ def stt_worker():
             print(f"[!!!] STT Worker error: {e}")
             time.sleep(1) # 오류 발생 시 잠시 대기
 
-# ▼▼▼ [신규] AI Worker 2: SC (경보음 감지) - 슬라이딩 윈도우 방식 적용 ▼▼▼
+# ▼▼▼ [수정] AI Worker 2: SC (경보음 감지) - '무음' 방어 코드 추가 ▼▼▼
 def sc_worker():
     """sc_task_queue에서 실시간 청크를 받아 1초 윈도우로 경보음을 감지"""
     print("[*] SC Worker thread started, waiting for audio chunks...")
@@ -290,6 +295,20 @@ def sc_worker():
     last_siren_alert_time = 0
     last_gas_alert_time = 0
 
+    # [신규] 경고 '종료' 감지를 위한 상태 변수
+    siren_active_state = False
+    gas_active_state = False
+    siren_silence_counter = 0
+    gas_silence_counter = 0
+    
+    # 0.5초(1 청크) * 5 = 2.5초 동안 'non'이 지속되면 종료로 간주
+    SILENCE_STOP_THRESHOLD = 5 
+    GAS_STOP_THRESHOLD = 5
+    
+    # [신규 버그 수정] '순수 디지털 무음' 오탐지 방지용 임계값
+    # (int16 최대값 32767 기준, 50 이하는 무시)
+    MIN_AUDIO_THRESHOLD = 50 
+
     while True:
         try:
             # 큐에 작업이 올 때까지 대기 (numpy array)
@@ -304,56 +323,95 @@ def sc_worker():
                 # 2a. 최신 1초 분량의 오디오 클립 추출
                 audio_clip_to_analyze = sc_audio_buffer[-SC_NUM_SAMPLES:]
 
-                # 2b. [버그 수정] preprocessor.logmel 함수 호출
-                mel_spec_np = preprocessor.logmel(
-                    audio_clip_to_analyze, 
-                    num_samples=SC_NUM_SAMPLES,
-                    sample_rate=SC_SAMPLE_RATE,
-                    n_fft=SC_N_FFT,
-                    hop_length=SC_HOP_LENGTH,
-                    n_mels=SC_N_MELS
-                )
-                
-                # preprocessor.logmel이 (B, C, H, W) 형태의 numpy를 반환
-                mel_spec_tensor = torch.from_numpy(mel_spec_np)
+                # [신규 버그 수정] '순수 디지털 무음'(all-zeros)이 'siren'으로 오탐지되는 문제 해결
+                if np.abs(audio_clip_to_analyze).max() < MIN_AUDIO_THRESHOLD:
+                    predicted_class = NON_INDEX # 3 (='non')
+                    print(f"(SC Worker) Pure silence chunk detected (Max: {np.abs(audio_clip_to_analyze).max()}), forcing 'non'.")
+                else:
+                    # 2b. [버그 수정] preprocessor.logmel 함수 호출
+                    mel_spec_np = preprocessor.logmel(
+                        audio_clip_to_analyze, 
+                        num_samples=SC_NUM_SAMPLES,
+                        sample_rate=SC_SAMPLE_RATE,
+                        n_fft=SC_N_FFT,
+                        hop_length=SC_HOP_LENGTH,
+                        n_mels=SC_N_MELS
+                    )
+                    
+                    # preprocessor.logmel이 (B, C, H, W) 형태의 numpy를 반환
+                    mel_spec_tensor = torch.from_numpy(mel_spec_np)
 
-                # 2c. 추론 (신규 AI 모델)
-                with torch.no_grad():
-                    output = sc_model(mel_spec_tensor)
-                    _, predicted_idx = torch.max(output.data, 1)
-                
-                predicted_class = predicted_idx.item()
+                    # 2c. 추론 (신규 AI 모델)
+                    with torch.no_grad():
+                        output = sc_model(mel_spec_tensor)
+                        _, predicted_idx = torch.max(output.data, 1)
+                    
+                    predicted_class = predicted_idx.item()
+
 
                 # 2d. 결과 판정 (사용자 요청 로직)
                 current_time = time.time()
                 
+                # [수정] '시작' 카운터와 '종료' 카운터를 분리하여 관리
+                
                 if predicted_class in SIREN_LIKE_INDICES: # (0, 1, 4)
                     siren_counter += 1
                     gas_counter = 0 
+                    siren_silence_counter = 0 # [신규] 'non' 카운터 초기화
                     print(f"(SC Worker) 'siren-like' chunk detected! (Count: {siren_counter})")
                     
                 elif predicted_class == GAS_INDEX: # (2)
                     gas_counter += 1
-                    siren_counter = 0 
+                    siren_counter = 0
+                    gas_silence_counter = 0 # [신규] 'non' 카운터 초기화
                     print(f"(SC Worker) 'gas' chunk detected! (Count: {gas_counter})")
                     
                 else: # (3, 'non')
-                    siren_counter = 0
-                    gas_counter = 0
+                    siren_counter = 0 # '시작' 카운터 초기화
+                    gas_counter = 0   # '시작' 카운터 초기화
+                    
+                    # [신규] 경고가 활성화된 상태였다면, '종료' 카운터 증가
+                    if siren_active_state:
+                        siren_silence_counter += 1
+                        print(f"(SC Worker) 'non' chunk while siren active (Silence Count: {siren_silence_counter})")
+                    if gas_active_state:
+                        gas_silence_counter += 1
+                        print(f"(SC Worker) 'non' chunk while gas active (Silence Count: {gas_silence_counter})")
 
-                # 2e. 스팸 방지 로직 포함하여 결과 전송
+                # 2e. 스팸 방지 및 '시작'/'종료' 결과 전송
+                
+                # 1. 사이렌 "시작" 로직
                 if siren_counter >= SIREN_CHUNK_THRESHOLD and (current_time - last_siren_alert_time > ALERT_COOLDOWN_SECONDS):
                     result_queue.put("siren") 
                     print(f"(SC Worker) Queued result: siren")
-                    siren_counter = 0 
+                    siren_counter = 0 # 쿨다운을 위해 카운터 리셋
                     last_siren_alert_time = current_time 
+                    siren_active_state = True  # [신규] 상태 활성화
+                    siren_silence_counter = 0  # [신규] 'non' 카운터 초기화
                 
+                # 2. 가스 "시작" 로직
                 if gas_counter >= GAS_CHUNK_THRESHOLD and (current_time - last_gas_alert_time > ALERT_COOLDOWN_SECONDS):
                     result_queue.put("gas") 
                     print(f"(SC Worker) Queued result: gas")
                     gas_counter = 0 
                     last_gas_alert_time = current_time 
+                    gas_active_state = True  # [신규] 상태 활성화
+                    gas_silence_counter = 0  # [신규] 'non' 카운터 초기화
                 
+                # 3. 사이렌 "종료" 로직 [신규]
+                if siren_active_state and siren_silence_counter >= SILENCE_STOP_THRESHOLD:
+                    result_queue.put("siren_stopped")
+                    print(f"(SC Worker) Queued result: siren_stopped")
+                    siren_active_state = False # [신규] 상태 비활성화
+                    siren_silence_counter = 0  # [신규] 'non' 카운터 초기화
+                
+                # 4. 가스 "종료" 로직 [신규]
+                if gas_active_state and gas_silence_counter >= GAS_STOP_THRESHOLD:
+                    result_queue.put("gas_stopped")
+                    print(f"(SC Worker) Queued result: gas_stopped")
+                    gas_active_state = False # [신규] 상태 비활성화
+                    gas_silence_counter = 0  # [신규] 'non' 카운터 초기화
+
                 # 2f. [버그 수정] 슬라이딩 윈도우: 0.5초(SLIDING_STEP_SAMPLES) 분량의 오래된 데이터 삭제
                 sc_audio_buffer = sc_audio_buffer[SLIDING_STEP_SAMPLES:]
 
@@ -474,7 +532,7 @@ def handle_command_client(client_socket):
         print("[*] Result sender thread started, waiting for AI results...")
         try:
             while True:
-                # 큐에 결과(예: "조심" 또는 "siren")가 올 때까지 대기
+                # 큐에 결과(예: "조심" 또는 "siren" 또는 "siren_stopped")가 올 때까지 대기
                 result_message = result_queue.get() 
                 if result_message is None: break # 스레드 종료 신호
                 
@@ -513,8 +571,11 @@ def handle_command_client(client_socket):
                 try:
                     app_value = int(command.split(':', 1)[1])
                     app_value = max(1, min(10, app_value)) 
-                    MIN_NOISE = 2000 
-                    MAX_NOISE = 200
+                    # ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
+                    # [수정] VAD 민감도 매핑 범위 변경
+                    MIN_NOISE = 4000 # 둔감 (기존 2000)
+                    MAX_NOISE = 400  # 민감 (기존 200)
+                    # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
                     mapped_threshold = MIN_NOISE + ((app_value - 1) / 9.0) * (MAX_NOISE - MIN_NOISE)
                     NOISE_THRESHOLD = int(mapped_threshold) 
                     print(f"\n[!!!] NOISE SENSITIVITY updated by app: {app_value} (Threshold: {NOISE_THRESHOLD})\n")
