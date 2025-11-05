@@ -11,16 +11,11 @@ import audioop
 import sys
 from thefuzz import fuzz
 
-# ▼▼▼ [버그 수정] 'preprocessor.py' import 오류 해결 ▼▼▼
-# 스크립트가 실행되는 *현재 파일*의 실제 경로를 가져옵니다
 script_path = os.path.abspath(os.path.dirname(__file__))
-# 이 경로를 Python이 모듈을 찾는 검색 경로 리스트에 추가합니다
 sys.path.append(script_path)
 print(f"[*] Added script path to sys.path: {script_path}")
-# ▲▲▲ [버그 수정] 완료 ▲▲▲
 
 
-# ▼▼▼ [순서 변경] preprocessor가 사용할 라이브러리를 먼저 import 합니다 ▼▼▼
 import requests 
 try:
     import keyboard
@@ -36,16 +31,15 @@ except ImportError:
 import queue # 스레드 간 작업 분배
 try:
     import torch
-    import torchaudio # Mel Spectrogram 변환에 필요 (preprocessor.py가 사용)
+    import torchaudio
 except ImportError as e:
     print(f"Error: Required AI libraries not found (torch, torchaudio).")
     print(f"Please install them using: pip install torch torchaudio")
     print(f"Details: {e}")
     sys.exit(1)
-# ▲▲▲ [순서 변경] 완료 ▲▲▲
+
 
 try:
-    # ▼▼▼ [버그 수정] preprocessor.py는 클래스가 아닌 함수 모듈이므로, 모듈 자체를 import ▼▼▼
     import preprocessor
 except ImportError as e:
     print("\n[!!!] FATAL IMPORT ERROR: Failed to import 'preprocessor.py'.")
@@ -53,7 +47,6 @@ except ImportError as e:
     print(f"    Detailed Error: {e}")
     print("    Please ensure 'preprocessor.py' is in the same directory and all its required libraries (torch, torchaudio, numpy) are installed.")
     sys.exit(1)
-# ▲▲▲ [버그 수정] 완료 ▲▲▲
 
 
 # --- 설정 ---
@@ -68,10 +61,9 @@ CHANNELS = 1
 SAMPWIDTH = 2
 CHUNK = 2048 # (0.128초)
 
-# ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
-# [수정] VAD 설정 (STT Worker용) - 기본값 2000으로 변경
-NOISE_THRESHOLD = 2000 
-# ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
+# VAD 설정 
+NOISE_THRESHOLD = 2000 # 소리 인식 기준치
 SILENCE_DURATION_SECONDS = 1.0
 REQUIRED_SILENCE_CHUNKS = int(SILENCE_DURATION_SECONDS * RATE / CHUNK)
 MIN_SPEECH_DURATION_SECONDS = 0.5 # (0.5초 미만 소음 무시)
@@ -88,15 +80,13 @@ keywords_lock = threading.Lock()
 # 2. SC (경보음 감지) 설정
 SC_MODEL_PATH = "model/resnet50_best.pt" # (하위 'model' 폴더에 위치)
 
-# ▼▼▼ [버그 수정] preprocessor.py의 logmel 함수 기본값과 1초(16000) 길이에 맞춤 ▼▼▼
 SC_SAMPLE_RATE = 16000 # (preprocessor.py와 일치시킴)
 SC_NUM_SAMPLES = 16000 # (logmel 함수에 전달할 고정 1초 길이)
 SC_N_FFT = 512
 SC_HOP_LENGTH = 160
 SC_N_MELS = 64
-# ▲▲▲ [버그 수정] 완료 ▲▲▲
 
-# ▼▼▼ [수정] 사용자가 확인한 'resnet50_classification.ipynb'의 클래스 라벨 ▼▼▼
+
 # CLASS_NAME = ["danger", "fire", "gas", "non", "tsunami"]
 SC_CLASS_LABELS = {
     0: 'danger',  # -> "siren"으로 통합
@@ -109,7 +99,6 @@ SC_CLASS_LABELS = {
 SIREN_LIKE_INDICES = {0, 1, 4} # danger, fire, tsunami
 GAS_INDEX = 2
 NON_INDEX = 3
-# ▲▲▲ [수정] 완료 ▲▲▲
 
 
 # --- 글로벌 변수 및 스레드 큐(Queue) ---
@@ -118,18 +107,16 @@ command_client_socket = None
 socket_lock = threading.Lock()
 manual_recording_triggered = threading.Event()
 
-# [신규] AI Worker용 작업 큐
+# AI Worker용 작업 큐
 stt_task_queue = queue.Queue(maxsize=10)     # STT (음성 버퍼) 작업 큐
 sc_task_queue = queue.Queue(maxsize=30)      # SC (실시간 청크) 작업 큐
 result_queue = queue.Queue(maxsize=10)       # 모든 AI의 최종 결과(문자열) 큐
 
-# [신규] SC 모델 전역 로드
 try:
     print(f"[*] Loading Sound Classification model from {SC_MODEL_PATH}...")
-    # (preprocessor.py는 함수 모음이므로, 클래스 인스턴스 생성 불필요)
-    # CPU로 모델 로드 (GPU 사용 시 'cpu' 제거)
+
     
-    # [버그 수정] PyTorch 2.6+ 호환을 위해 weights_only=False 추가
+    # PyTorch 2.6+ 호환을 위해 weights_only=False 추가
     sc_model = torch.load(SC_MODEL_PATH, map_location=torch.device('cpu'), weights_only=False) 
     
     sc_model.eval() # 추론 모드로 설정
@@ -142,7 +129,7 @@ except Exception as e:
     print(f"[!!!] FATAL ERROR: Failed to load SC model: {e}")
     sys.exit(1)
 
-# (기존) HighPassFilter 클래스 (오버플로우 버그 수정된 버전)
+# HighPassFilter 클래스 (오버플로우 버그 수정된 버전)
 class HighPassFilter:
     def __init__(self, alpha=0.98):
         self.alpha = alpha
@@ -181,7 +168,7 @@ class HighPassFilter:
         self.last_output = int(last_out)
         return filtered_samples.tobytes()
 
-# (기존) create_wav_file 함수
+# create_wav_file 함수
 def create_wav_file(pcm_data, rate, is_temp=True, filename_prefix="rec_"):
     timestamp = int(time.time())
     if is_temp:
@@ -201,7 +188,7 @@ def create_wav_file(pcm_data, rate, is_temp=True, filename_prefix="rec_"):
         wf.writeframes(pcm_data)
     return file_path
 
-# (기존) run_stt 함수 (환각 억제 파라미터 적용된 버전)
+# run_stt 함수 (환각 억제 파라미터 적용된 버전)
 def run_stt(file_path):
     normalized_path = os.path.normpath(file_path)
     print(f"\n(STT Worker) Running STT on {normalized_path} via HTTP...")
@@ -235,8 +222,7 @@ def run_stt(file_path):
         if tempfile.gettempdir() in normalized_path and os.path.exists(normalized_path):
             os.remove(normalized_path)
 
-# ▼▼▼ [신규] AI Worker 1: STT (음성 인식) ▼▼▼
-# (기존 process_and_send_keywords 함수를 스레드 워커로 변경)
+# AI Worker 1: STT (음성 인식)
 def stt_worker():
     """stt_task_queue에서 VAD가 완료된 오디오 버퍼를 받아 STT를 수행"""
     print("[*] STT Worker thread started, waiting for speech tasks...")
@@ -246,7 +232,6 @@ def stt_worker():
             audio_buffer = stt_task_queue.get() 
             if audio_buffer is None: break # 스레드 종료 신호
             
-            # --- 기존 process_and_send_keywords 로직 ---
             temp_wav_path = create_wav_file(bytes(audio_buffer), RATE, is_temp=True)
             text_result = run_stt(temp_wav_path)
             
@@ -268,7 +253,7 @@ def stt_worker():
 
                 if keywords_to_send:
                     response_message = ",".join(sorted(list(set(keywords_to_send))))
-                    # [수정] 소켓 대신 result_queue로 결과 전송
+                    # 소켓 대신 result_queue로 결과 전송
                     result_queue.put(response_message)
                     print(f"(STT Worker) Queued result: {response_message}")
         
@@ -276,7 +261,7 @@ def stt_worker():
             print(f"[!!!] STT Worker error: {e}")
             time.sleep(1) # 오류 발생 시 잠시 대기
 
-# ▼▼▼ [수정] AI Worker 2: SC (경보음 감지) - '무음' 방어 코드 추가 ▼▼▼
+# AI Worker 2: SC (경보음 감지) - '무음' 방어 코드 추가
 def sc_worker():
     """sc_task_queue에서 실시간 청크를 받아 1초 윈도우로 경보음을 감지"""
     print("[*] SC Worker thread started, waiting for audio chunks...")
@@ -295,7 +280,7 @@ def sc_worker():
     last_siren_alert_time = 0
     last_gas_alert_time = 0
 
-    # [신규] 경고 '종료' 감지를 위한 상태 변수
+    # 경고 '종료' 감지를 위한 상태 변수
     siren_active_state = False
     gas_active_state = False
     siren_silence_counter = 0
@@ -305,7 +290,7 @@ def sc_worker():
     SILENCE_STOP_THRESHOLD = 5 
     GAS_STOP_THRESHOLD = 5
     
-    # [신규 버그 수정] '순수 디지털 무음' 오탐지 방지용 임계값
+    # '순수 디지털 무음' 오탐지 방지용 임계값
     # (int16 최대값 32767 기준, 50 이하는 무시)
     MIN_AUDIO_THRESHOLD = 50 
 
@@ -323,12 +308,12 @@ def sc_worker():
                 # 2a. 최신 1초 분량의 오디오 클립 추출
                 audio_clip_to_analyze = sc_audio_buffer[-SC_NUM_SAMPLES:]
 
-                # [신규 버그 수정] '순수 디지털 무음'(all-zeros)이 'siren'으로 오탐지되는 문제 해결
+                # '순수 디지털 무음'(all-zeros)이 'siren'으로 오탐지되는 문제 해결
                 if np.abs(audio_clip_to_analyze).max() < MIN_AUDIO_THRESHOLD:
                     predicted_class = NON_INDEX # 3 (='non')
                     print(f"(SC Worker) Pure silence chunk detected (Max: {np.abs(audio_clip_to_analyze).max()}), forcing 'non'.")
                 else:
-                    # 2b. [버그 수정] preprocessor.logmel 함수 호출
+                    # 2b. preprocessor.logmel 함수 호출
                     mel_spec_np = preprocessor.logmel(
                         audio_clip_to_analyze, 
                         num_samples=SC_NUM_SAMPLES,
@@ -352,25 +337,25 @@ def sc_worker():
                 # 2d. 결과 판정 (사용자 요청 로직)
                 current_time = time.time()
                 
-                # [수정] '시작' 카운터와 '종료' 카운터를 분리하여 관리
+                # '시작' 카운터와 '종료' 카운터를 분리하여 관리
                 
                 if predicted_class in SIREN_LIKE_INDICES: # (0, 1, 4)
                     siren_counter += 1
                     gas_counter = 0 
-                    siren_silence_counter = 0 # [신규] 'non' 카운터 초기화
+                    siren_silence_counter = 0 # 'non' 카운터 초기화
                     print(f"(SC Worker) 'siren-like' chunk detected! (Count: {siren_counter})")
                     
                 elif predicted_class == GAS_INDEX: # (2)
                     gas_counter += 1
                     siren_counter = 0
-                    gas_silence_counter = 0 # [신규] 'non' 카운터 초기화
+                    gas_silence_counter = 0 # 'non' 카운터 초기화
                     print(f"(SC Worker) 'gas' chunk detected! (Count: {gas_counter})")
                     
                 else: # (3, 'non')
                     siren_counter = 0 # '시작' 카운터 초기화
                     gas_counter = 0   # '시작' 카운터 초기화
                     
-                    # [신규] 경고가 활성화된 상태였다면, '종료' 카운터 증가
+                    # 경고가 활성화된 상태였다면, '종료' 카운터 증가
                     if siren_active_state:
                         siren_silence_counter += 1
                         print(f"(SC Worker) 'non' chunk while siren active (Silence Count: {siren_silence_counter})")
@@ -386,8 +371,8 @@ def sc_worker():
                     print(f"(SC Worker) Queued result: siren")
                     siren_counter = 0 # 쿨다운을 위해 카운터 리셋
                     last_siren_alert_time = current_time 
-                    siren_active_state = True  # [신규] 상태 활성화
-                    siren_silence_counter = 0  # [신규] 'non' 카운터 초기화
+                    siren_active_state = True  # 상태 활성화
+                    siren_silence_counter = 0  # 'non' 카운터 초기화
                 
                 # 2. 가스 "시작" 로직
                 if gas_counter >= GAS_CHUNK_THRESHOLD and (current_time - last_gas_alert_time > ALERT_COOLDOWN_SECONDS):
@@ -395,24 +380,24 @@ def sc_worker():
                     print(f"(SC Worker) Queued result: gas")
                     gas_counter = 0 
                     last_gas_alert_time = current_time 
-                    gas_active_state = True  # [신규] 상태 활성화
-                    gas_silence_counter = 0  # [신규] 'non' 카운터 초기화
+                    gas_active_state = True  # 상태 활성화
+                    gas_silence_counter = 0  # 'non' 카운터 초기화
                 
-                # 3. 사이렌 "종료" 로직 [신규]
+                # 3. 사이렌 "종료" 로직
                 if siren_active_state and siren_silence_counter >= SILENCE_STOP_THRESHOLD:
                     result_queue.put("siren_stopped")
                     print(f"(SC Worker) Queued result: siren_stopped")
-                    siren_active_state = False # [신규] 상태 비활성화
-                    siren_silence_counter = 0  # [신규] 'non' 카운터 초기화
+                    siren_active_state = False # 상태 비활성화
+                    siren_silence_counter = 0  # 'non' 카운터 초기화
                 
-                # 4. 가스 "종료" 로직 [신규]
+                # 4. 가스 "종료" 로직
                 if gas_active_state and gas_silence_counter >= GAS_STOP_THRESHOLD:
                     result_queue.put("gas_stopped")
                     print(f"(SC Worker) Queued result: gas_stopped")
-                    gas_active_state = False # [신규] 상태 비활성화
-                    gas_silence_counter = 0  # [신규] 'non' 카운터 초기화
+                    gas_active_state = False # 상태 비활성화
+                    gas_silence_counter = 0  # 'non' 카운터 초기화
 
-                # 2f. [버그 수정] 슬라이딩 윈도우: 0.5초(SLIDING_STEP_SAMPLES) 분량의 오래된 데이터 삭제
+                # 2f. 슬라이딩 윈도우: 0.5초(SLIDING_STEP_SAMPLES) 분량의 오래된 데이터 삭제
                 sc_audio_buffer = sc_audio_buffer[SLIDING_STEP_SAMPLES:]
 
         except Exception as e:
@@ -425,7 +410,7 @@ def sc_worker():
             time.sleep(1)
 
 
-# ▼▼▼ [수정] handle_audio_client (오디오 "생산자") ▼▼▼
+# handle_audio_client (오디오 생산자)
 def handle_audio_client(client_socket):
     global audio_client_socket
     with socket_lock: audio_client_socket = client_socket
@@ -453,7 +438,7 @@ def handle_audio_client(client_socket):
             # 1. 하이패스 필터 적용
             filtered_data_bytes = hp_filter.process(data)
             
-            # --- 2. [신규] SC Worker로 실시간 전송 ---
+            # --- 2. SC Worker로 실시간 전송 ---
             try:
                 # SC Worker는 NumPy 배열을 사용
                 audio_chunk_np = np.frombuffer(filtered_data_bytes, dtype=np.int16)
@@ -464,12 +449,12 @@ def handle_audio_client(client_socket):
             except Exception as e:
                 print(f"[!] SC Queue Error: {e}")
 
-            # --- 3. [기존] STT Worker를 위한 VAD 로직 ---
+            # --- 3. STT Worker를 위한 VAD 로직 ---
             rms = audioop.rms(filtered_data_bytes, SAMPWIDTH)
             print(f"RMS: {rms:<5}\r", end="")
             sys.stdout.flush()
 
-            # (녹음 로직 - 기존과 동일)
+            # 녹음 로직
             if manual_recording_triggered.is_set():
                 if manual_recording_start_time == 0:
                     print("\n*** Starting 5-second manual recording... ***")
@@ -482,7 +467,7 @@ def handle_audio_client(client_socket):
                     manual_recording_triggered.clear()
                     print(">>> Press 'g' to start a new 5-second recording <<<")
 
-            # (VAD 로직 - 기존과 동일)
+            # VAD 로직
             if rms > NOISE_THRESHOLD:
                 if not is_speaking: print("\n(VAD) Speaking detected...")
                 is_speaking = True
@@ -495,10 +480,10 @@ def handle_audio_client(client_socket):
                 audio_buffer.extend(filtered_data_bytes)
                 
                 if silence_counter > REQUIRED_SILENCE_CHUNKS:
-                    # [수정] STT 요청 전, 최소 음성 길이 확인
+                    # STT 요청 전, 최소 음성 길이 확인
                     if speech_chunk_counter >= REQUIRED_SPEECH_CHUNKS:
                         print(f"\n(VAD) Speech long enough ({speech_chunk_counter} chunks), queueing for STT...")
-                        # [수정] STT 함수 직접 호출 대신, stt_task_queue에 버퍼(bytes)를 넣음
+                        # STT 함수 직접 호출 대신, stt_task_queue에 버퍼(bytes)를 넣음
                         try:
                             stt_task_queue.put_nowait(bytes(audio_buffer))
                         except queue.Full:
@@ -519,14 +504,14 @@ def handle_audio_client(client_socket):
         print("\n[*] Audio client connection closed.")
 
 
-# ▼▼▼ [수정] handle_command_client (명령 "수신" 및 결과 "송신") ▼▼▼
+# handle_command_client (명령 수신 및 결과 송신)
 def handle_command_client(client_socket):
     global TARGET_KEYWORDS, NOISE_THRESHOLD, command_client_socket
     print("[*] Command client connected.")
     with socket_lock:
         command_client_socket = client_socket # 전역 변수에 소켓 저장
     
-    # --- [신규] 결과(STT, SC)를 앱으로 전송하는 스레드 ---
+    # --- 결과(STT, SC)를 앱으로 전송하는 스레드 ---
     def result_sender(sock):
         """result_queue에서 결과를 받아 앱으로 전송"""
         print("[*] Result sender thread started, waiting for AI results...")
@@ -550,10 +535,10 @@ def handle_command_client(client_socket):
     sender_thread = threading.Thread(target=result_sender, args=(client_socket,))
     sender_thread.daemon = True
     sender_thread.start()
-    # --- [신규] 전송 스레드 끝 ---
+    # --- 전송 스레드 끝 ---
 
     try:
-        # --- [기존] 앱으로부터 명령(키워드, 민감도)을 수신하는 로직 ---
+        # --- 앱으로부터 명령(키워드, 민감도)을 수신하는 로직 ---
         socket_file = client_socket.makefile('r', encoding='utf-8')
         for line in socket_file:
             command = line.strip()
@@ -594,7 +579,7 @@ def handle_command_client(client_socket):
         result_queue.put(None)
 
 
-# (기존) start_server 함수
+# start_server 함수
 def start_server(port, handler):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
         server_socket.bind((HOST, port))
@@ -607,16 +592,16 @@ def start_server(port, handler):
             client_handler.daemon = True
             client_handler.start()
 
-# (기존) keyboard_listener 함수
+# keyboard_listener 함수
 def keyboard_listener():
     print("(Keyboard listener started)")
     keyboard.add_hotkey('g', lambda: manual_recording_triggered.set())
     while True:
         time.sleep(1)
 
-# ▼▼▼ [수정] main 함수 (AI Worker 스레드 시작) ▼▼▼
+# ▼▼▼ main 함수 (AI Worker 스레드 시작) ▼▼▼
 def main():
-    # 1. Whisper 서버 헬스 체크 (기존)
+    # 1. Whisper 서버 헬스 체크
     try:
         response = requests.get(WHISPER_SERVER_URL.replace("/inference", "/health"))
         if response.status_code != 200 or response.json().get("status") != "ok":
@@ -627,15 +612,15 @@ def main():
         print("      Please ensure 'whisper-server.exe' is running (with -l ko) on port 8081.")
         sys.exit(1)
 
-    # 2. 녹음 폴더 생성 (기존)
+    # 2. 녹음 폴더 생성
     if not os.path.exists(SAVE_PATH): os.makedirs(SAVE_PATH)
     
-    # 3. 키보드 리스너 시작 (기존)
+    # 3. 키보드 리스너 시작
     k_thread = threading.Thread(target=keyboard_listener)
     k_thread.daemon = True
     k_thread.start()
     
-    # 4. [신규] AI Worker 스레드 시작
+    # 4. AI Worker 스레드 시작
     print("[*] Starting AI Workers...")
     stt_thread = threading.Thread(target=stt_worker)
     stt_thread.daemon = True
@@ -646,7 +631,7 @@ def main():
     sc_thread.start()
     print("[*] AI Workers started.")
 
-    # 5. [기존] TCP 서버 스레드 시작
+    # 5. TCP 서버 스레드 시작
     audio_thread = threading.Thread(target=start_server, args=(AUDIO_PORT, handle_audio_client))
     command_thread = threading.Thread(target=start_server, args=(COMMAND_PORT, handle_command_client))
     audio_thread.daemon = True
@@ -654,13 +639,13 @@ def main():
     audio_thread.start()
     command_thread.start()
     
-    # 6. 메인 스레드 대기 (기존)
+    # 6. 메인 스레드 대기
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n[*] Server is shutting down.")
-        # [신규] 종료 시 워커 스레드들도 정리
+        # 종료 시 워커 스레드들도 정리
         stt_task_queue.put(None)
         sc_task_queue.put(None)
         result_queue.put(None)
